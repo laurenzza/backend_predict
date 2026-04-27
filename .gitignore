@@ -1,0 +1,8 @@
+__pycache__/
+.vscode/
+.env
+test.ipynb
+model/
+models/
+uploads/
+archives/

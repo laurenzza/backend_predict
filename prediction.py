@@ -182,15 +182,29 @@ def run_prediction(csv_path, user_id, on_complete=None):
         model.add(Dense(1))
 
 
+        # Gunakan Adam supaya lebih stabil belajar; SGD dengan LR kecil sering membuat output "lurus" (underfit)
         model.compile(
             loss=tf.keras.losses.Huber(),
-            optimizer=tf.keras.optimizers.SGD(learning_rate=1.0000e-04, momentum=0.9),
+            optimizer=Adam(learning_rate=1e-3),
             metrics=[tf.keras.metrics.MeanAbsoluteError(), tf.keras.metrics.RootMeanSquaredError()]
         )
 
+        # Pakai validation untuk early stopping agar model tidak under/overfit
+        callbacks = [
+            tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True),
+            tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=7, min_lr=1e-5)
+        ]
 
         start_lstm = time.time()
-        history = model.fit(X_train_sales, y_train_sales, epochs=100, batch_size=32, verbose=1)
+        history = model.fit(
+            X_train_sales,
+            y_train_sales,
+            validation_data=(X_val_sales, y_val_sales),
+            epochs=200,
+            batch_size=32,
+            verbose=1,
+            callbacks=callbacks,
+        )
         end_lstm = time.time()
 
 
@@ -304,7 +318,9 @@ def run_prediction(csv_path, user_id, on_complete=None):
             globals()["ARIMA_BIAS_APPLIED"] = True
 
 
-        forecast_arima_future = forecast_arima.copy()
+        # Untuk alokasi produk, gunakan forecast ARIMA yang konsisten dengan performa out-of-sample.
+        # (Tanpa ini, model forecast yang dipakai bisa tetap "melenceng" walau metrik MAE/RMSE sudah holdout.)
+        forecast_arima_future = predict_future_arima(arima_fit_holdout, df_arima, steps=30)
 
 
         print("[Sanity Check] Rata-rata forecast ARIMA 30 hari (sesudah bias):", float(forecast_arima.mean()))

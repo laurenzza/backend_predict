@@ -3,7 +3,6 @@ __pycache__/
 .env
 test.ipynb
 model/
-models/
 uploads/
 archives/
 tes/

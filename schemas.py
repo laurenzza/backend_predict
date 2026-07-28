@@ -47,6 +47,15 @@ class UserAktivasi(UserBase):
         orm_mode = True
 
 # DATASET
+class ManualTransactionInput(BaseModel):
+    invoice: str
+    tanggal_pembayaran: date
+    status_terakhir: str
+    nama_produk: str
+    jumlah_produk_dibeli: int
+    harga_jual_idr: int
+    total_penjualan_idr: int
+
 class SalesDataResponse(BaseModel):
     sale_id: int
     invoice: Optional[str] = None

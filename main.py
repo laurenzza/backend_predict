@@ -319,9 +319,11 @@ async def upload_sales(
 
         records = df.to_dict(orient="records")
         conn.bulk_insert_mappings(models.Sale, records)
+        conn.query(models.User).update({models.User.csv_path: new_csv_name})
 
         if mode == 'replace' and file_exists and prev_csv_path != full_path:
             os.remove(prev_csv_path)
+
         elif mode == 'append' and data_to_append:
             with open(full_path, "ab") as f:
                 f.write(data_to_append)
@@ -332,6 +334,99 @@ async def upload_sales(
         conn.rollback()
         if mode != 'append':
             os.remove(full_path)
+        raise HTTPException(500, detail=f"Database insertion failed: {str(e)}")
+    
+    return schemas.UserResponse(
+        user_id=user.user_id,
+        email=user.email,
+        nama_lengkap=user.nama_lengkap,
+        nama_toko=user.nama_toko,
+        role=user.role,
+        csv_path=user.csv_path
+    )
+
+@app.post("/api/sales/upload/manual", tags=["Dataset"], response_model=schemas.UserResponse)
+async def upload_sales_manual(
+    transactions: List[schemas.ManualTransactionInput], # Menerima list of object dari frontend
+    conn: Session = Depends(get_db), 
+    token: str = Depends(oauth2_scheme)
+):
+    payload = verify_token(token)
+    user = crud.get_user_by_email(conn, payload["email"])
+    
+    if not transactions:
+        raise HTTPException(status_code=400, detail="Transaction list cannot be empty")
+
+    # 1. Konversi input manual menjadi Pandas DataFrame
+    # Mengubah list of Pydantic models menjadi list of dictionaries
+    records_list = [t.model_dump() for t in transactions]
+    df_new = pd.DataFrame(records_list)
+    
+    # Cleaning dan standardisasi kolom agar sesuai dengan database models.Sale
+    df_new.columns = df_new.columns.str.lower().str.replace(" ", "_").str.replace("[()]", "", regex=True)
+    df_new = df_new.replace({np.nan: None, pd.NaT: None})
+    df_new["tanggal_pembayaran"] = pd.to_datetime(df_new["tanggal_pembayaran"], errors="coerce")
+    df_new["user_id"] = user.user_id
+
+    # Buat CSV string dari dataframe baru (tanpa index)
+    # Kita butuh ini untuk menulis ke file fisik
+    csv_string = df_new.drop(columns=["user_id"]).to_csv(index=False)
+    csv_bytes = csv_string.encode('utf-8')
+
+    # 2. Logic File System
+    prev_csv_path = None
+    if user.csv_path:
+        prev_csv_path = os.path.join(UPLOAD_DIR, user.csv_path)
+
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    file_exists = prev_csv_path and os.path.exists(prev_csv_path)
+
+    full_path = prev_csv_path
+    
+    try:
+        if file_exists:
+            # --- MODE APPEND (File sudah ada) ---
+            # Cari baris baru pertama untuk membuang header csv_string
+            try:
+                header_end_index = csv_bytes.index(b'\n')
+                data_to_append = csv_bytes[header_end_index + 1:]
+                
+                # Tulis data baru ke file lama
+                with open(full_path, "ab") as f:
+                    # Pastikan baris terakhir file lama punya newline sebelum append
+                    # (Opsional tapi mencegah bug CSV format)
+                    f.write(b'\n') 
+                    f.write(data_to_append)
+            except ValueError:
+                pass
+        else:
+            # --- MODE CREATE NEW (File belum ada) ---
+            new_csv_name = hash_path(f"user_id{user.user_id}_manual_upload") + ".csv"
+            full_path = os.path.join(UPLOAD_DIR, new_csv_name)
+
+            with open(full_path, "wb") as f:
+                f.write(csv_bytes)
+            
+            user.csv_path = new_csv_name
+            conn.query(models.User).update({models.User.csv_path: new_csv_name})
+            conn.commit() # Save the new path to user
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update physical CSV file: {str(e)}")
+
+    # 3. Logic Database Insertion
+    try:
+        # Convert DataFrame ke dictionary format untuk SQLAlchemy bulk insert
+        db_records = df_new.to_dict(orient="records")
+        conn.bulk_insert_mappings(models.Sale, db_records)
+        
+        conn.commit()
+        conn.refresh(user)
+    except Exception as e:
+        conn.rollback()
+        # Jika DB gagal dan file baru saja dibuat (bukan append), hapus filenya
+        if not file_exists and os.path.exists(full_path):
+             os.remove(full_path)
         raise HTTPException(500, detail=f"Database insertion failed: {str(e)}")
     
     return schemas.UserResponse(
@@ -1015,6 +1110,423 @@ def compare_models_accuracy():
 
         except Exception as e:
             print(e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# ENDPOINT 1: Compare Last 6 Months + 1 Month Forecast
+# ==========================================
+@app.get("/api/compare/last_6_months/{user_id}")
+def compare_models_monthly_accuracy(user_id: int, job = Depends(get_job), db: Session = Depends(get_db)):
+    """
+    Membaca data historis dan prediksi langsung dari hasil caching prediction 200726.py
+    sehingga data web 100% identik dengan hasil eksperimen notebook.
+    """
+    if job.status == "running" or job.status == "failed":
+        return {
+            "description": "Agregasi Bulanan Aktual vs Prediksi (6 Bulan Terakhir + 1 Bulan Ke Depan)",
+            "data": [],
+            "job_status": job.status
+        }
+    
+    with model_lock:
+        try:
+            import joblib
+            import os
+            
+            res_path = 'models/prediction_results.pkl'
+            if not os.path.exists(res_path):
+                return {"data": [], "job_status": "No data. Harap jalankan pipeline prediksi."}
+
+            res = joblib.load(res_path)
+            df_log = res['df_log']
+            semua_hasil = res['semua_hasil']
+            df_depan = res['df_depan']
+            bulan_depan_str = res['bulan_depan']
+
+            results = []
+            
+            # ----------------------------------------------------
+            # 1. EVALUASI HISTORIS (6 Bulan Terakhir)
+            # ----------------------------------------------------
+            start_idx = max(0, len(df_log) - 6)
+            for i in range(start_idx, len(df_log)):
+                row = df_log.iloc[i]
+                df_m = semua_hasil[i] # Memuat rincian per-produk di bulan tersebut
+
+                # -- Breakdown menggunakan ARIMA --
+                breakdown_rev = []
+                df_m_sorted_rev = df_m.sort_values('pred_rev_arima', ascending=False)
+                for rank, (_, p) in enumerate(df_m_sorted_rev.iterrows()):
+                    breakdown_rev.append({
+                        "rank": rank + 1,
+                        "pred_name": p['nama_produk'],
+                        "actual_name": p['nama_produk'], 
+                        "pred_revenue": float(p['pred_rev_arima']),
+                        "actual_revenue": float(p['aktual_rev']),
+                        "pred_qty": float(p['pred_qty_arima']),
+                        "actual_qty": float(p['aktual_qty'])
+                    })
+
+                breakdown_qty = []
+                df_m_sorted_qty = df_m.sort_values('pred_qty_arima', ascending=False)
+                for rank, (_, p) in enumerate(df_m_sorted_qty.iterrows()):
+                    breakdown_qty.append({
+                        "rank": rank + 1,
+                        "pred_name": p['nama_produk'],
+                        "actual_name": p['nama_produk'],
+                        "pred_revenue": float(p['pred_rev_arima']),
+                        "actual_revenue": float(p['aktual_rev']),
+                        "pred_qty": float(p['pred_qty_arima']),
+                        "actual_qty": float(p['aktual_qty'])
+                    })
+
+                results.append({
+                    "period": row['bulan'],
+                    "type": "Historical",
+                    "actual": float(row['aktual']),
+                    "arima_pred": float(row['pred_arima']),
+                    "lstm_pred": float(row['pred_lstm']),
+                    "ensemble_pred": 0.0, # Ensemble ditiadakan sesuai instruksi
+                    "diff_arima": float(row['aktual'] - row['pred_arima']),
+                    "diff_lstm": float(row['aktual'] - row['pred_lstm']),
+                    "diff_ensemble": 0.0,
+                    "product_breakdown_revenue": breakdown_rev,
+                    "product_breakdown_qty": breakdown_qty
+                })
+
+            # ----------------------------------------------------
+            # 2. PREDIKSI MASA DEPAN (1 Bulan Ke Depan)
+            # ----------------------------------------------------
+            # Sesuai request: Total menggunakan LSTM, Breakdown menggunakan ARIMA
+            future_lstm_total = float(df_depan['pred_rev_lstm'].sum())
+            future_arima_total = float(df_depan['pred_rev_arima'].sum())
+
+            future_breakdown_rev = []
+            df_depan_sorted_rev = df_depan.sort_values('pred_rev_arima', ascending=False)
+            for rank, (_, p) in enumerate(df_depan_sorted_rev.iterrows()):
+                future_breakdown_rev.append({
+                    "rank": rank + 1,
+                    "pred_name": p['nama_produk'],
+                    "actual_name": "-",
+                    "pred_revenue": float(p['pred_rev_arima']),
+                    "actual_revenue": 0.0,
+                    "pred_qty": float(p['pred_qty_arima']),
+                    "actual_qty": 0.0
+                })
+
+            future_breakdown_qty = []
+            df_depan_sorted_qty = df_depan.sort_values('pred_qty_arima', ascending=False)
+            for rank, (_, p) in enumerate(df_depan_sorted_qty.iterrows()):
+                future_breakdown_qty.append({
+                    "rank": rank + 1,
+                    "pred_name": p['nama_produk'],
+                    "actual_name": "-",
+                    "pred_revenue": float(p['pred_rev_arima']),
+                    "actual_revenue": 0.0,
+                    "pred_qty": float(p['pred_qty_arima']),
+                    "actual_qty": 0.0
+                })
+
+            y, m = bulan_depan_str.split('-')
+            target_month_label = f"{y}-{m}" 
+
+            results.append({
+                "period": target_month_label + " (Prediksi)",
+                "type": "Forecast",
+                "actual": 0.0, 
+                "arima_pred": future_arima_total,
+                "lstm_pred": future_lstm_total,
+                "ensemble_pred": 0.0,
+                "diff_arima": 0.0,
+                "diff_lstm": 0.0,
+                "diff_ensemble": 0.0,
+                "product_breakdown_revenue": future_breakdown_rev,
+                "product_breakdown_qty": future_breakdown_qty
+            })
+
+            return {
+                "description": "Agregasi Bulanan Aktual vs Prediksi",
+                "data": results,
+                "job_status": job.status
+            }
+
+        except Exception as e:
+            print(f"Error in monthly compare: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# ENDPOINT 2: Prediksi Produk (Bulan Depan Saja)
+# ==========================================
+@app.get("/api/predict/top10_next_month")
+def predict_top_10_next_month(db: Session = Depends(get_db)):
+    with model_lock:
+        try:
+            import joblib
+            import os
+
+            res_path = 'models/prediction_results.pkl'
+            if not os.path.exists(res_path):
+                return {"job_status": "No data"}
+
+            res = joblib.load(res_path)
+            df_depan = res['df_depan']
+            bulan_depan_str = res['bulan_depan']
+            
+            y, m = bulan_depan_str.split('-')
+            nama_bulan = ["", "Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
+            target_month_label = f"{nama_bulan[int(m)]} {y}"
+
+            # Total penghasilan menggunakan LSTM (Menghasilkan ~12.9 Juta sesuai di notebook)
+            total_revenue_lstm = float(df_depan['pred_rev_lstm'].sum())
+
+            # Breakdown produk diurutkan menggunakan hasil perhitungan ARIMA
+            df_depan_sorted = df_depan.sort_values('pred_rev_arima', ascending=False)
+            
+            results = []
+            for i, (_, p) in enumerate(df_depan_sorted.iterrows()):
+                results.append({
+                    "rank": i + 1,
+                    "name": p['nama_produk'],
+                    "revenue": float(p['pred_rev_arima']),
+                    "qty": float(p['pred_qty_arima'])
+                })
+
+            return {
+                "description": "Prediksi Penjualan Bulan Depan (Total LSTM, Breakdown ARIMA)",
+                "target_month": target_month_label,
+                "total_revenue": total_revenue_lstm,
+                "top_10": results[:10],
+                "others": results[10:]
+            }
+
+        except Exception as e:
+            print(f"Error next month prediction: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+        
+# ==========================================
+# ENDPOINT: Compare Last 6 Months + 1 Month Forecast
+# ==========================================
+@app.get("/api/archive/compare/last_6_months/{user_id}")
+def compare_models_monthly_accuracy(user_id, job = Depends(get_job)):
+    """
+    Membandingkan data aktual vs prediksi secara BULANAN untuk 6 bulan terakhir,
+    ditambah dengan prediksi 1 bulan (30 hari) ke depan beserta nilai Ensemble.
+    """
+    if job.status == "running" or job.status == "failed":
+        return {
+            "description": "Agregasi Bulanan Aktual vs Prediksi (6 Bulan Terakhir + 1 Bulan Ke Depan)",
+            "data": [],
+            "job_status": job.status
+        }
+    
+    with model_lock:
+        try:
+            if 'actual_data_last_180' not in metadata:
+                raise HTTPException(status_code=500, detail="Metadata belum memiliki data 180 hari. Harap jalankan ulang pipeline prediksi.")
+
+            actual_data = metadata['actual_data_last_180']
+            dates = pd.to_datetime(actual_data['dates'])
+            actual_values = np.array(actual_data['values'])
+            
+            # ----------------------------------------------------
+            # 1. EVALUASI HISTORIS (6 BULAN KE BELAKANG)
+            # ----------------------------------------------------
+            
+            n_obs = len(arima_model.fittedvalues)
+            arima_preds_log = arima_model.predict(start=n_obs-180, end=n_obs-1)
+            
+            if IS_LOG_ARIMA:
+                arima_preds = np.expm1(arima_preds_log)
+            else:
+                arima_preds = arima_preds_log
+                
+            arima_preds_values = np.maximum(arima_preds.values if hasattr(arima_preds, 'values') else arima_preds, 0.0)
+
+            current_lstm_batch = metadata['lstm_input_for_compare_180'].reshape(1, TIME_STEP, 1)
+            lstm_preds_values = []
+            
+            for i in range(180):
+                lstm_pred_scaled = lstm_model.predict(current_lstm_batch, verbose=0)[0][0]
+                lstm_val = float(scaler.inverse_transform([[lstm_pred_scaled]])[0][0])
+                lstm_preds_values.append(max(0.0, lstm_val))
+                current_lstm_batch = np.append(current_lstm_batch[:, 1:, :], [[[lstm_pred_scaled]]], axis=1)
+
+            df_hist = pd.DataFrame({
+                'date': dates,
+                'actual': actual_values,
+                'arima_pred': arima_preds_values,
+                'lstm_pred': lstm_preds_values
+            })
+            
+            df_hist['month'] = df_hist['date'].dt.strftime('%Y-%m')
+            
+            # PERBAIKAN: Buang kolom 'date' sebelum melakukan operasi sum()
+            monthly_hist = df_hist.drop(columns=['date']).groupby('month').sum().reset_index()
+            monthly_hist = monthly_hist.tail(6)
+
+            results = []
+            for _, row in monthly_hist.iterrows():
+                act_val = row['actual']
+                arima_val = row['arima_pred']
+                lstm_val = row['lstm_pred']
+                ens_val = (0.40 * arima_val) + (0.60 * lstm_val) # PNYB Default Ensemble
+                
+                results.append({
+                    "period": row['month'],
+                    "type": "Historical",
+                    "actual": act_val,
+                    "arima_pred": arima_val,
+                    "lstm_pred": lstm_val,
+                    "ensemble_pred": ens_val,
+                    "diff_arima": act_val - arima_val,
+                    "diff_lstm": act_val - lstm_val,
+                    "diff_ensemble": act_val - ens_val
+                })
+
+            # ----------------------------------------------------
+            # 2. PREDIKSI MASA DEPAN (1 BULAN KE DEPAN)
+            # ----------------------------------------------------
+            
+            future_arima_log = arima_model.forecast(steps=30)
+            if IS_LOG_ARIMA:
+                future_arima_vals = np.expm1(future_arima_log)
+            else:
+                future_arima_vals = future_arima_log
+            future_arima_total = max(0.0, float(np.sum(future_arima_vals)))
+
+            future_lstm_batch = metadata['last_sequence'].reshape(1, TIME_STEP, 1)
+            future_lstm_total = 0.0
+            
+            for _ in range(30):
+                pred_scaled = lstm_model.predict(future_lstm_batch, verbose=0)[0][0]
+                pred_real = float(scaler.inverse_transform([[pred_scaled]])[0][0])
+                future_lstm_total += max(0.0, pred_real)
+                future_lstm_batch = np.append(future_lstm_batch[:, 1:, :], [[[pred_scaled]]], axis=1)
+
+            future_ens_total = (0.40 * future_arima_total) + (0.60 * future_lstm_total)
+
+            # Label bulan untuk masa depan secara absolut (mutlak 1 bulan ke depan)
+            last_date = dates.iloc[-1] if hasattr(dates, 'iloc') else dates[-1]
+            last_date = pd.to_datetime(last_date)
+            
+            if last_date.month == 12:
+                next_month = 1
+                next_year = last_date.year + 1
+            else:
+                next_month = last_date.month + 1
+                next_year = last_date.year
+                
+            future_period_label = f"{next_year}-{next_month:02d}"
+
+            results.append({
+                "period": future_period_label + " (Prediksi)",
+                "type": "Forecast",
+                "actual": 0.0, 
+                "arima_pred": future_arima_total,
+                "lstm_pred": future_lstm_total,
+                "ensemble_pred": future_ens_total,
+                "diff_arima": 0.0,
+                "diff_lstm": 0.0,
+                "diff_ensemble": 0.0
+            })
+
+            return {
+                "description": "Agregasi Bulanan Aktual vs Prediksi (6 Bulan Terakhir + 1 Bulan Ke Depan)",
+                "data": results,
+                "job_status": job.status
+            }
+
+        except Exception as e:
+            print(f"Error in monthly compare: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# ENDPOINT 3: Prediksi Produk (Bulan Depan)
+# ==========================================
+@app.get("/api/archived/predict/top10_next_month")
+def predict_top_10_next_month():
+    with model_lock:
+        try:
+            import pandas as pd
+            
+            # 1. Prediksi Total Revenue 30 Hari Ke Depan (LSTM)
+            future_lstm_batch = metadata['last_sequence'].reshape(1, TIME_STEP, 1)
+            future_lstm_total = 0.0
+            for _ in range(30):
+                pred_scaled = lstm_model.predict(future_lstm_batch, verbose=0)[0][0]
+                pred_real = float(scaler.inverse_transform([[pred_scaled]])[0][0])
+                future_lstm_total += max(0.0, pred_real)
+                future_lstm_batch = np.append(future_lstm_batch[:, 1:, :], [[[pred_scaled]]], axis=1)
+
+            # 2. Prediksi Total Revenue 30 Hari Ke Depan (ARIMA)
+            future_arima_log = arima_model.forecast(steps=30)
+            if IS_LOG_ARIMA:
+                future_arima_vals = np.expm1(future_arima_log)
+            else:
+                future_arima_vals = future_arima_log
+            future_arima_total = max(0.0, float(np.sum(future_arima_vals)))
+
+            # 3. Gabungkan dengan Ensemble (Bobot 50:50)
+            total_ens_revenue = (0.5 * future_arima_total) + (0.5 * future_lstm_total)
+
+            # --- LOGIKA BULAN KALENDER ---
+            last_date = pd.to_datetime(metadata['last_date'])
+            if last_date.month == 12:
+                next_month = 1
+                next_year = last_date.year + 1
+            else:
+                next_month = last_date.month + 1
+                next_year = last_date.year
+                
+            nama_bulan = ["", "Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
+            target_month_label = f"{nama_bulan[next_month]} {next_year}"
+
+            # 4. Alokasi Proporsional ke Tiap Produk
+            product_share = metadata.get('product_share', {})
+            product_prices = metadata.get('product_prices', {})
+
+            all_products = []
+            for name, share in product_share.items():
+                if name == "__Lainnya__": continue
+                
+                est_rev = total_ens_revenue * share
+                price = product_prices.get(name, 0)
+                est_qty = round(est_rev / price) if price > 0 else 0
+
+                all_products.append({
+                    "name": name,
+                    "revenue": est_rev,
+                    "qty": max(est_qty, 1) if est_rev > 0 else 0
+                })
+
+            # 5. Urutkan Tertinggi ke Terendah
+            all_products.sort(key=lambda x: x['revenue'], reverse=True)
+
+            # Beri Ranking
+            results = []
+            for i, p in enumerate(all_products):
+                results.append({
+                    "rank": i + 1,
+                    "name": p['name'],
+                    "revenue": p['revenue'],
+                    "qty": p['qty']
+                })
+
+            # 6. Pisahkan Top 10 dan sisanya (Others)
+            top_10 = results[:10]
+            others = results[10:]
+
+            return {
+                "description": "Prediksi Penjualan Bulan Depan",
+                "target_month": target_month_label,
+                "total_revenue": total_ens_revenue,
+                "top_10": top_10,
+                "others": others
+            }
+
+        except Exception as e:
+            print(f"Error next month prediction: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/predictions/predict/seven_days/{user_id}")

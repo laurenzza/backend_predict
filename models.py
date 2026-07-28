@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, D
 from sqlalchemy.orm import relationship
 from database import Base
 
+
 class User(Base):
     __tablename__ = "users"
 
@@ -13,6 +14,7 @@ class User(Base):
     role = Column(String(50), nullable=False)
     status_aktivasi = Column(String(50), nullable=False, default="PENDING")
     csv_path = Column(String(255), nullable=False, default="")
+
 
 class Sale(Base):
     __tablename__ = "sales"
@@ -28,6 +30,7 @@ class Sale(Base):
 
     user_id = Column(Integer, nullable=False, index=True)
 
+
 class PredictionMetric(Base):
     __tablename__ = "prediction_metrics"
 
@@ -41,7 +44,13 @@ class PredictionMetric(Base):
     lstm_waktu_train = Column(Double, nullable=False)
     lstm_memori = Column(Double, nullable=False)
 
+    # Field metrik Ensemble Adaptif. nullable=True agar baris lama
+    # (sebelum migrasi kolom ini) tidak error saat dibaca.
+    ensemble_mae = Column(Double, nullable=True)
+    ensemble_rmse = Column(Double, nullable=True)
+
     user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False, index=True)
+
 
 class PredictionComparison(Base):
     __tablename__ = "prediction_comparisons"
@@ -54,6 +63,7 @@ class PredictionComparison(Base):
 
     user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False, index=True)
 
+
 class TotalPrediction(Base):
     __tablename__ = "total_predictions"
 
@@ -63,6 +73,7 @@ class TotalPrediction(Base):
     hasil_total_penjualan_lstm = Column(Double, nullable=False)
 
     user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False, index=True)
+
 
 class DailyProductPrediction(Base):
     __tablename__ = "daily_product_predictions"
@@ -74,6 +85,7 @@ class DailyProductPrediction(Base):
 
     user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False, index=True)
 
+
 class WeeklyProductPrediction(Base):
     __tablename__ = "weekly_product_predictions"
 
@@ -84,15 +96,29 @@ class WeeklyProductPrediction(Base):
 
     user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False, index=True)
 
+
 class MonthlyProductPrediction(Base):
+    """
+    PERBAIKAN: struktur tabel ini diubah total agar sesuai dengan Class
+    Diagram pada skripsi (Sub-bab 3.1.2.7), yaitu menyimpan kuantitas dan
+    revenue hasil prediksi ARIMA, LSTM, dan Ensemble Adaptif per produk
+    per bulan -- bukan lagi hanya nama produk seperti versi sebelumnya.
+    """
     __tablename__ = "monthly_product_predictions"
 
     monthly_product_prediction_id = Column(Integer, primary_key=True, autoincrement="auto")
-    bulan = Column(Integer, nullable=False)
-    hasil_nama_produk_arima = Column(String(255), nullable=False)
-    hasil_nama_produk_lstm = Column(String(255), nullable=False)
+    bulan = Column(Integer, nullable=False)  # 1-12
+    nama_produk = Column(String(255), nullable=False)
+
+    pred_qty_arima = Column(Double, nullable=False)
+    pred_rev_arima = Column(Double, nullable=False)
+    pred_qty_lstm = Column(Double, nullable=False)
+    pred_rev_lstm = Column(Double, nullable=False)
+    pred_qty_ens = Column(Double, nullable=False)
+    pred_rev_ens = Column(Double, nullable=False)
 
     user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False, index=True)
+
 
 class PredictionJob(Base):
     __tablename__ = "prediction_jobs"

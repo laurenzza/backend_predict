@@ -168,7 +168,7 @@ def get_top_products(db: Session, user_id: int):
         func.count(models.Sale.sale_id).label("total_transaksi"),
         func.sum(models.Sale.total_penjualan_idr).label("total_penjualan"),
         func.sum(models.Sale.jumlah_produk_dibeli).label("total_unit_terjual"),
-    ).group_by("nama_produk").order_by(desc("total_penjualan")).limit(10)
+    ).group_by("nama_produk").order_by(desc("total_penjualan"))
 
 # STATISTICS
 def get_monthly_sales_trend(db: Session, user_id: int):
